@@ -1,0 +1,846 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+*Instruction:*
+
+if you are interested in the final model, run everything before Data Visualization, and then run "resample" and "create train and test set", and finally "use the whole train data to train."
+
+The visualization of NYC map can make the R studio react slowly, hang in there. You can simply comment that specific chunk or skip that chunk to save some time.
+
+Some of the chunks (most cross validation processes) might take 15-25 mins to finish running. If it takes longer than that, it's highly potential that your R studio crashed. Restart the whole session and follow the same procedure.
+
+# Import Packages and the Original Dataset
+
+```{r import packages}
+# install these packages first
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(glmnet)
+library(tree)
+library(randomForest)
+library(e1071)
+library(rpart)
+library(cluster)
+library(cld2) # this would be helpful for detecting languages
+library(caret) # this would be helpful for tuning parameters (not sure if we need it or not)
+library(pROC) # this can be helpful for ROC curve
+```
+
+```{r import data}
+# change the path to import the original data
+airbnb <- read.csv("/Users/t.l./Desktop/DUKE MQM/Fall 2022/Data Science for Biz/Final Project/Airbnb_Open_Data.csv")
+
+source("/Users/t.l./Desktop/DUKE MQM/Fall 2022/Data Science for Biz/Final Project/DataAnalyticsFunctions.R")
+
+summary(airbnb)
+```
+
+# Data Cleaning
+
+```{r drop columns that is not helpful for our model}
+# drop columns that we don't need
+drop <- c("id", "host.id", "host.name", "country", "country.code", "license")
+airbnb <- airbnb[,!(names(airbnb) %in% drop)]
+ncol(airbnb) # from 26 columns to 20 columns
+```
+
+```{r drop rows whose target is missing}
+# drop rows without review.rate.number
+airbnb <- airbnb[-which(is.na(airbnb$review.rate.number)),]
+nrow(airbnb) # from 102599 rows to 102273 rows
+```
+
+```{r change "" to NA}
+airbnb$NAME[airbnb$NAME == ""] <- NA
+# airbnb <- airbnb[-which(is.na(airbnb$NAME)),]
+
+airbnb$host_identity_verified[airbnb$host_identity_verified == ""] <- NA
+airbnb$instant_bookable[airbnb$instant_bookable == ""] <- NA
+airbnb$cancellation_policy[airbnb$cancellation_policy == ""] <- NA
+airbnb$room.type[airbnb$room.type == ""] <- NA
+airbnb$Construction.year[airbnb$Construction.year == ""] <- NA
+airbnb$price[airbnb$price == ""] <- NA
+airbnb$service.fee[airbnb$service.fee == ""] <- NA
+airbnb$minimum.nights[airbnb$minimum.nights == ""] <- NA
+airbnb$last.review[airbnb$last.review == ""] <- NA
+airbnb$availability.365[airbnb$availability.365 == ""] <- NA
+airbnb$house_rules[airbnb$house_rules == ""] <- NA
+airbnb$calculated.host.listings.count[airbnb$calculated.host.listings.count == ""] <- NA
+airbnb$review.rate.number[airbnb$review.rate.number == ""] <- NA
+airbnb$reviews.per.month[airbnb$reviews.per.month == ""] <- NA
+airbnb$neighbourhood[airbnb$neighbourhood == ""] <- NA
+# 
+# nrow(airbnb) # from 102273 rows to 102032 rows
+# this airbnb dataset can be used to tell which language has a better avg rating in EDA
+```
+
+```{r detect languages to prepare for creating dummies}
+unique(detect_language(airbnb$NAME, plain_text = TRUE))
+```
+
+```{r add dummies to tell what languages the names are in}
+airbnb$name_unknown <- ifelse(is.na(airbnb$NAME), 1, 0)
+airbnb$name_en <- ifelse(detect_language(airbnb$NAME) == "en", 1, 0)
+airbnb$name_cn <- ifelse((detect_language(airbnb$NAME) == "zh" | detect_language(airbnb$NAME) == "zh-Hant") , 1, 0)
+airbnb$name_kr <- ifelse(detect_language(airbnb$NAME) == "ko", 1, 0)
+airbnb$name_fr <- ifelse(detect_language(airbnb$NAME) == "fr", 1, 0)
+
+airbnb$name_en[is.na(airbnb$name_en)] <- 0
+airbnb$name_cn[is.na(airbnb$name_cn)] <- 0
+airbnb$name_kr[is.na(airbnb$name_kr)] <- 0
+airbnb$name_fr[is.na(airbnb$name_fr)] <- 0
+# if these columns are all 0 in a row, then it implies name is in other languages
+```
+
+```{r change year to numeric type}
+airbnb$Construction.year <- as.numeric(format(as.Date(ISOdate(airbnb$Construction.year,1,1)), "%Y"))
+airbnb$last.review <- as.numeric(format(as.Date(airbnb$last.review,format="%m/%d/%Y"), "%Y")) # now as year
+```
+
+```{r change money to numeric type}
+airbnb$price <- as.numeric(gsub(",", "", gsub("\\$", "", airbnb$price)))
+airbnb$service.fee <- as.numeric(gsub(",", "", gsub("\\$", "", airbnb$service.fee)))
+```
+
+```{r check typos within neighbourhood.group}
+unique(airbnb$neighbourhood.group)
+```
+
+```{r correct the typos in neighbourhood.group}
+airbnb$neighbourhood.group <- sub("brookln", "Brooklyn", airbnb$neighbourhood.group)
+airbnb$neighbourhood.group <- sub("manhatan", "Manhattan", airbnb$neighbourhood.group)
+unique(airbnb$neighbourhood.group)
+```
+
+```{r adjust neighbourhood_dict column}
+# match neighbourhood with neighbourhood.dict
+neighbourhood_dict <- data.frame(neighbourhood = unique(airbnb$neighbourhood)[!is.na(unique(airbnb$neighbourhood))])
+
+for (i in 1:nrow(neighbourhood_dict)){
+  index <- which(airbnb$neighbourhood == neighbourhood_dict$neighbourhood[i])
+  correct.neighbourhood.group <- airbnb$neighbourhood.group[index][!is.na(airbnb$neighbourhood.group)]
+  correct.neighbourhood.group <- correct.neighbourhood.group[which(correct.neighbourhood.group!= "")][1]
+  neighbourhood_dict$neighbourhood.group[i] = correct.neighbourhood.group
+}
+
+# substitute "" with correct neighbourhood_dict
+for (i in 1:length(airbnb$neighbourhood.group)) {
+  if (airbnb$neighbourhood.group[i] == "") {
+    neighbourhood <- airbnb$neighbourhood[i]
+    airbnb$neighbourhood.group[i] <- neighbourhood_dict$neighbourhood.group[neighbourhood_dict$neighbourhood == neighbourhood]
+  }
+}
+unique(airbnb$neighbourhood.group)
+```
+
+```{r check typos in last.review}
+sum(airbnb$last.review[airbnb$last.review > 2022],na.rm=TRUE)
+```
+
+```{r work on the typos in last.review}
+airbnb$last.review <- ifelse(airbnb$last.review <= 2022, airbnb$last.review, 2022)
+```
+
+```{r review what the dataset looks like now}
+summary(airbnb)
+# airbnb will be the dataset we use to explore different languages' impact on rating
+# can also create graph based on lat and long to show where the apartments are
+```
+
+```{r see distinct values of each column}
+#unique(airbnb$host_identity_verified)
+#unique(airbnb$neighbourhood.group)
+#unique(airbnb$neighbourhood)
+#unique(airbnb$cancellation_policy)
+#unique(airbnb$room.type)
+#unique(airbnb$house_rules)
+```
+
+```{r adjust minimum.nights and availability.365}
+airbnb$minimum.nights <- ifelse(airbnb$minimum.nights <= 1, 1,airbnb$minimum.nights) # change to 1 if smaller than 1
+airbnb$minimum.nights <- ifelse(airbnb$minimum.nights >= 31, 31,airbnb$minimum.nights) # change to 31 if larger than 31
+airbnb$availability.365 <- ifelse(airbnb$availability.365 <= 0, 0, airbnb$availability.365) # change to 0 if smaller than 0
+airbnb$availability.365 <- ifelse(airbnb$availability.365 >= 365, 365, airbnb$availability.365) # change to 365 if larger than 365
+# need to decide the question to ask so that we can drop useless columns
+```
+
+```{r check if there are too many missing values within a row}
+row <- c()
+for (i in 1:nrow(airbnb)){
+  num_missing <- sum(is.na(airbnb[i,]))
+  if (num_missing > ncol(airbnb) * 0.5){ # set the threshold to be 0.5
+    row <- cbind(row, i)
+  }
+}
+row
+```
+
+```{r prepare for filling missing values}
+data_mean <- sapply(airbnb[,c(10:19,21:25)],median, na.rm=TRUE) # these numbers are the columns with numerical values
+data_mean
+```
+
+```{r fit missing value}
+# need to fit na as shown in the following code
+impute_data <- function(vec, mn) {
+  ifelse(is.na(vec), mn, vec)
+}
+
+for(i in c(10:19)) {
+  airbnb[,i]<-impute_data(airbnb[,i],data_mean[i-9])
+}
+for(i in c(21:25)){
+  airbnb[,i]<-impute_data(airbnb[,i],data_mean[i-9])
+}
+summary(airbnb)
+```
+
+```{r create new column called years.since.construction}
+airbnb$years.since.construction <- airbnb$last.review - airbnb$Construction.year
+# airbnb$years.since.construction
+# because there are duplicated rows containing same listings in different year
+# not necessarily to be mentioned in the report
+```
+
+```{r change the missing value in categorical column to be the most frequent word}
+for (i in c(2:4,7:9)){
+  airbnb[,i][is.na(airbnb[,i])] <- names(which.max(table(airbnb[i])))
+}
+
+# in case we want it to be the most frequent word in that column
+# names(which.max(table(airbnb[i])))
+```
+
+```{r check that character variables are correct}
+unique(airbnb$host_identity_verified)
+unique(airbnb$neighbourhood.group)
+#unique(airbnb$neighbourhood)
+unique(airbnb$instant_bookable)
+unique(airbnb$cancellation_policy)
+unique(airbnb$room.type)
+#unique(airbnb$house_rules)
+```
+
+```{r create column to phrase a binomial question}
+airbnb$high.rating <- as.factor(ifelse(airbnb$review.rate.number == 5, 1, 0))
+unique(airbnb$high.rating)
+```
+
+```{r}
+# write.csv(airbnb, "/Users/t.l./Desktop/DUKE MQM/Fall 2022/Data Science for Biz/Final Project/cleaned_airbnb.csv")
+```
+
+# Data Visualization (Maggie's EDA)
+
+```{r}
+airbnb %>%
+  ggplot(aes(x = Construction.year)) + geom_bar() + labs(x = 'Construction Year', y = 'Total Constructed', title = 'Total Amount of Airbnbs by Construction Year')
+```
+
+```{r}
+airbnb %>%
+  ggplot(aes(x = room.type, y = price)) + geom_boxplot() + labs(x = 'Type of Room', y = 'Price', title = 'Airbnb Price by Room Type')
+```
+
+```{r}
+airbnb %>%
+  ggplot(aes(x = price,  fill = review.rate.number)) + geom_histogram(binwidth =25) + facet_wrap(~review.rate.number) + labs(x = 'Price', y = 'Count of Airbnbs', title = 'Total Amount of Airbnbs by Price and Review' , fill = "Rating")
+```
+
+```{r}
+airbnb %>%
+  ggplot(aes(x = review.rate.number, fill = room.type)) + geom_bar(position = "fill") + labs(x = 'Rating', y = 'Proportion', title = 'Proportion of Airbnb Rental Type by Rating', fill = 'Type of Rental')
+```
+
+```{r}
+airbnb %>%
+  ggplot(aes(x = review.rate.number, fill = room.type)) + geom_bar() + labs(x = 'Rating', y = 'Count of Ratings', title = 'Total amount of Airbnb Rental Type by Rating', fill = 'Type of Rental')
+```
+
+```{r}
+airbnb %>%
+  ggplot(aes(x = review.rate.number, fill = neighbourhood.group)) + geom_bar() + labs(x = 'Rating', y = 'Count of Ratings', title = 'Total amount of Airbnb Rental Type by Neighbourhood Group', fill = 'Neighbourhood Group')
+```
+
+```{r visualize nyc map1}
+# probably comment this if you don't want to run this over and over again
+# it can take some storage space
+library(leaflet)
+
+df <- data.frame(lat = airbnb$lat, long = airbnb$long)
+
+
+leaflet(df) %>%
+  addTiles() %>%
+  setView(-74.00, 40.71, zoom = 12) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addCircles(data = df, weight =0)
+```
+
+```{r}
+library(leaflet)
+df <- data.frame(lat = airbnb$lat, long = airbnb$long, col = airbnb$high.rating)
+pal <- colorFactor(
+  palette = c('blue', 'red'),
+  domain = df$col
+)
+
+leaflet(df) %>%
+  addTiles() %>%
+  setView(-74.00, 40.71, zoom = 12) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addCircles(data = df, weight =0, color = ~pal(col))
+```
+
+# Unsupervised Learning
+
+## Hierarchical Clustering
+
+```{r}
+drop_cl <- c("NAME", "num.of.reviews", "last.review", "reviews.per.month",
+          "review.rate.number","calculated.host.listings.count", "house_rules", 
+          "number.of.reviews")
+
+airbnb_cl <- airbnb[,!(names(airbnb) %in% drop_cl)]
+
+set.seed(1)
+airbnb_cl <- airbnb_cl %>% 
+    nest_by(neighbourhood, host_identity_verified, instant_bookable, cancellation_policy, 
+            room.type, .key = "xy") %>% 
+    mutate(sample = list(xy[sample(1:nrow(xy), 
+                                   size = round(0.01*nrow(xy))),])) %>%
+    select(-xy) %>%
+    summarize(sample)
+
+airbnb_cl$host_identity_verified <- as.factor(airbnb_cl$host_identity_verified)
+airbnb_cl$neighbourhood <- as.factor(airbnb_cl$neighbourhood)
+airbnb_cl$instant_bookable <- as.factor(airbnb_cl$instant_bookable)
+airbnb_cl$cancellation_policy <- as.factor(airbnb_cl$cancellation_policy)
+airbnb_cl$room.type <- as.factor(airbnb_cl$room.type)
+airbnb_cl$neighbourhood.group <- as.factor(airbnb_cl$neighbourhood.group)
+airbnb_cl$name_cn <- as.factor(airbnb_cl$name_cn)
+airbnb_cl$name_en <- as.factor(airbnb_cl$name_en)
+airbnb_cl$name_kr <- as.factor(airbnb_cl$name_kr)
+airbnb_cl$name_fr <- as.factor(airbnb_cl$name_fr)
+airbnb_cl$name_unknown <- as.factor(airbnb_cl$name_unknown)
+  
+dissimilarity <- daisy(airbnb_cl, metric = c("gower"))
+```
+
+```{r}
+hc<-hclust(dissimilarity, method = "complete")
+plot(hc, labels=FALSE)
+rect.hclust(hc, k=5, border="red")
+cluster<-cutree(hc, k=5)
+airbnb_cl$cluster <- as.factor(cluster)
+```
+
+```{r cluster can be separated by neighborhood group}
+ggplot(data = airbnb_cl, aes(x = cluster, fill = neighbourhood.group)) +
+    geom_bar(position = "fill") + ylab("proportion") +
+    stat_count(geom = "text", 
+               aes(label = stat(count)),
+               position=position_fill(vjust=0.6), colour="white")
+```
+
+```{r}
+ggplot(data = airbnb_cl, aes(x = cluster, fill = host_identity_verified)) +
+    geom_bar(position = "fill") + ylab("proportion") +
+    stat_count(geom = "text", 
+               aes(label = stat(count)),
+               position=position_fill(vjust=0.6), colour="white")
+```
+
+```{r cluster 2-5 can be clustered by instant_bookable?}
+ggplot(data = airbnb_cl, aes(x = cluster, fill = instant_bookable)) +
+    geom_bar(position = "fill") + ylab("proportion") +
+    stat_count(geom = "text", 
+               aes(label = stat(count)),
+               position=position_fill(vjust=0.6), colour="white")
+```
+
+```{r}
+ggplot(data = airbnb_cl, aes(x = cluster, fill = cancellation_policy)) +
+    geom_bar(position = "fill") + ylab("proportion") +
+    stat_count(geom = "text", 
+               aes(label = stat(count)),
+               position=position_fill(vjust=0.6), colour="white")
+```
+
+```{r}
+ggplot(data = airbnb_cl, aes(x = cluster, fill = room.type)) +
+    geom_bar(position = "fill") + ylab("proportion") +
+    stat_count(geom = "text", 
+               aes(label = stat(count)),
+               position=position_fill(vjust=0.6), colour="white")
+```
+
+```{r}
+ggplot(data = airbnb_cl, aes(x = cluster, y = price)) +
+    geom_boxplot(alpha = 0) +
+    geom_jitter(alpha = 0.5, width = 0.2, height = 0.2, color = "tomato")
+```
+
+```{r cluster 4-5 can be distinguished by construction year}
+ggplot(data = airbnb_cl, aes(x = cluster, y = Construction.year)) +
+    geom_boxplot(alpha = 0) +
+    geom_jitter(alpha = 0.5, width = 0.2, height = 0.2, color = "tomato")
+```
+
+```{r}
+df <- data.frame(lat = airbnb_cl$lat, long = airbnb_cl$long, col = airbnb_cl$cluster)
+pal <- colorFactor(
+  palette = c("red","green", "yellow","blue", "pink"),
+  domain = df$col
+)
+
+leaflet(df) %>%
+  addTiles() %>%
+  setView(-74.00, 40.71, zoom = 12) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addCircles(data = df, weight =3, color = ~pal(col))
+```
+
+## Word Cloud
+
+```{r}
+library(tm)
+library(wordcloud)
+#Create a vector containing only the text
+text <- airbnb$house_rules
+# Create a corpus  
+docs <- Corpus(VectorSource(text))
+docs <- docs %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(stripWhitespace)
+docs <- tm_map(docs, content_transformer(tolower))
+docs <- tm_map(docs, removeWords, stopwords("english"))
+docs<- tm_map(docs, stemDocument)
+
+dtm <- TermDocumentMatrix(docs) 
+matrix <- as.matrix(dtm) 
+words <- sort(rowSums(matrix),decreasing=TRUE) 
+df <- data.frame(word = names(words),freq=words)
+wordcloud(words = df$word, freq = df$freq, min.freq = 1, max.words=200, random.order=FALSE, rot.per=0.35, colors=brewer.pal(8, "Dark2"))
+```
+
+
+# Resample and preprocessing
+
+```{r drop columns not helpful for classification models}
+drop2 <- c("NAME", "lat", "long", "num.of.reviews", "last.review", "reviews.per.month",
+          "review.rate.number","calculated.host.listings.count", "house_rules", "number.of.reviews")
+airbnb <- airbnb[,!(names(airbnb) %in% drop2)] # drop more that we don't need
+ncol(airbnb) # from 27 to 18 columns
+```
+
+```{r check what features are left}
+colnames(airbnb)
+```
+
+```{r check imbalanced class}
+unique(airbnb$high.rating)
+sum(airbnb$high.rating == 1)
+sum(airbnb$high.rating == 0)
+```
+
+```{r resample to 40% of the original}
+set.seed(5)
+final_airbnb <- airbnb %>% 
+    nest_by(neighbourhood, host_identity_verified, instant_bookable, cancellation_policy, room.type, .key = "xy") %>% 
+    mutate(sample = list(xy[sample(1:nrow(xy), 
+                                   size = round(0.5*nrow(xy))),])) %>%
+    select(-xy) %>%
+    summarize(sample)
+```
+
+```{r we check to see that the distribution is pretty much the same}
+summary(airbnb)
+summary(final_airbnb)
+```
+
+# Modeling
+
+## create train and test set
+
+```{r prepare for splitting data into two sets}
+# this is to make sure that most neighbourhood appear in both train and test set
+set.seed(1)
+mydf <- final_airbnb %>%
+  mutate(all = paste(neighbourhood)) %>%
+  group_by(all) %>%
+  summarise(total=n()) %>%
+  filter(total>=2)
+
+final_airbnb2 <- final_airbnb[paste(final_airbnb$neighbourhood) %in% mydf$all,] 
+```
+
+```{r separate train and test}
+set.seed(1)
+IND_TRAIN <- createDataPartition(paste(final_airbnb2$neighbourhood), p = 0.75)$Resample
+
+ #train set
+ train <- final_airbnb2[ IND_TRAIN,]
+ #test set
+ test <- final_airbnb2[-IND_TRAIN,]
+```
+
+```{r}
+#write.csv(train, "/Users/t.l./Desktop/DUKE MQM/Fall 2022/Data Science for Biz/Final Project/train.csv")
+#write.csv(test, "/Users/t.l./Desktop/DUKE MQM/Fall 2022/Data Science for Biz/Final Project/test.csv")
+```
+
+
+```{r useless efforts done before}
+#sample<-sample(c(TRUE,FALSE), nrow(final_airbnb), replace = TRUE, prob = c(0.7, 0.3))
+#train<-final_airbnb[sample,]
+#test<-final_airbnb[!sample,]
+
+#trainIndex <- createDataPartition(final_airbnb$high.rating, p = .7,
+#                                 list = FALSE,
+#                                times = 1)
+#train <- final_airbnb[ trainIndex,]
+#test <- final_airbnb[-trainIndex,]
+```
+
+```{r train and test outcome distribution}
+mean(train$high.rating == 1)
+mean(test$high.rating == 1)
+# it's around 22/23 vs. 77/78 in both train and test :)
+```
+
+```{r check that all neightbourhood in test is trained before in the model}
+neighbor <- c()
+for (i in 1:length(unique(test$neighbourhood))){
+  test_neighbor_i <- unique(test$neighbourhood)[i]
+  if (test_neighbor_i %in% unique(train$neighbourhood) == FALSE){
+    neighbor <- cbind(neighbor, test_neighbor_i)
+  }
+}
+neighbor
+# if returns nothing, then all levels of neighbourhood in test set is contained in train set.
+```
+
+## cross validation
+
+```{r drop neighborhood}
+idx <- which(names(train) == "neighbourhood")
+train<- train[,-idx]
+```
+
+why do we exclude the neighborhood? - rank deficient fit may be misleading - new levels in factor(neighborhood) in cross validation
+
+### Preparation for cross validation
+
+```{r prepare for lasso and postlasso - matrix}
+Mx<- model.matrix(high.rating ~ ., data=train)[,-1]
+My<- train$high.rating == 1
+```
+
+```{r prepare for lasso and postlasso - run CV lasso to find lambda}
+lasso <- glmnet(Mx,My,family="binomial")
+lassoCV <- cv.glmnet(Mx,My,family="binomial")
+par(mar=c(1.5,1.5,2,1.5))
+par(mai=c(1.5,1.5,2,1.5))
+plot(lassoCV, main="Fitting Graph for CV Lasso \n \n # of non-zero coefficients  ", xlab = expression(paste("log(",lambda,")")))
+#### the deviance of lasso does not necessarily change as much
+#### probably explain why in our paper?
+```
+
+```{r get the "theory" number}
+num.features <- ncol(Mx)
+num.n <- nrow(Mx)
+num.rating <- sum(My)
+w <- (num.rating/num.n)*(1-(num.rating/num.n))
+#### For the binomial case, a theoretically valid choice is
+lambda.theory <- sqrt(w*log(num.features/0.05)/num.n)
+
+lassoTheory <- glmnet(Mx,My, family="binomial",lambda = lambda.theory)
+length(support(lassoTheory$beta)) # lasso theory doesn't work because it takes 0 coefficient
+```
+
+```{r run post lasso and get lambda values}
+#### Post Lasso #####
+features.min <- support(lasso$beta[,which.min(lassoCV$cvm)])
+length(features.min)
+
+features.1se <- support(lasso$beta[,which.min( (lassoCV$lambda-lassoCV$lambda.1se)^2)])
+length(features.1se) 
+
+features.theory <- support(lassoTheory$beta)
+length(features.theory)
+
+data.min <- data.frame(Mx[,features.min],My)
+data.1se <- data.frame(Mx[,features.1se],My) # PL.1se does not work
+data.theory <- data.frame(Mx[,features.theory],My)
+```
+
+```{r prepare for cross validation - fold numbers}
+set.seed(1)
+nfold <- 10
+n = nrow(train)
+foldid <- rep(1:nfold,each=ceiling(n/nfold))[sample(1:n)]
+```
+
+```{r create dataframe for the outputs of cross validation}
+OOS <- data.frame(m.lr=rep(NA,nfold), 
+                  m.lr.lasso.min=rep(NA,nfold), m.lr.lasso.1se=rep(NA,nfold), m.lr.lasso.theory=rep(NA,nfold),
+                  m.lr.pl.min=rep(NA,nfold), #m.lr.pl.1se=rep(NA,nfold), 
+                  m.lr.pl.theory=rep(NA,nfold),
+                  m.tree=rep(NA,nfold), m.rf = rep(NA,nfold), m.average=rep(NA,nfold)) 
+```
+
+```{r decide the performance metric}
+PerformanceMeasure <- function(actual, prediction, threshold=.5) {
+  1-mean( abs( (prediction>threshold) - actual ) )  #accuracy
+  #R2(y=actual, pred=prediction, family="binomial")
+  #1-mean( abs( (prediction- actual) ) )  
+}
+```
+
+### back to cross validation again
+
+```{r actually run a cross validation}
+# :( takes extreeeeeeemely long time to run
+# kindly wait for 10 minutes please...
+for(k in 1:nfold){ 
+  cv_train <- which(foldid!=k) # train on all but fold `k'
+  actual <- as.numeric(as.character(train$high.rating[-cv_train]))
+
+  ### Logistic regression
+  m.lr <- glm(high.rating == 1 ~., data=train, subset=cv_train, family="binomial")
+  pred.lr <- predict(m.lr, newdata=train[-cv_train,], type="response")
+  OOS$m.lr <- PerformanceMeasure(actual= actual, pred=pred.lr)
+  
+  ### the Lasso estimates min 
+  m.lr.l.min  <- glmnet(Mx[cv_train,],My[cv_train], family="binomial",lambda = lassoCV$lambda.min)
+  pred.lr.l.min <- predict(m.lr.l.min, newx=Mx[-cv_train,], type="response")
+  OOS$m.lr.lasso.min[k] <- PerformanceMeasure(actual=My[-cv_train], prediction=pred.lr.l.min)
+  
+  ### the Lasso estimates 1se
+  m.lr.l.1se  <- glmnet(Mx[cv_train,],My[cv_train], family="binomial",lambda = lassoCV$lambda.1se)
+  pred.lr.l.1se <- predict(m.lr.l.1se, newx=Mx[-cv_train,], type="response")
+  OOS$m.lr.lasso.1se[k] <- PerformanceMeasure(actual=My[-cv_train], prediction=pred.lr.l.1se)
+  
+  ### the Lasso estimates theory
+  m.lr.l.theory  <- glmnet(Mx[cv_train,],My[cv_train], family="binomial",lambda = lambda.theory)
+  pred.lr.l.theory <- predict(m.lr.l.theory, newx=Mx[-cv_train,], type="response")
+  OOS$m.lr.lasso.theory[k] <- PerformanceMeasure(actual=My[-cv_train], prediction=pred.lr.l.theory)
+  
+  ### This is the CV for the Post Lasso Estimates
+  rmin <- glm(My~., data=data.min, subset=cv_train, family="binomial")
+  
+  #if ( length(features.1se) == 0){  r1se <- glm(high.rating~1, data=train, subset=cv_train, family="binomial") 
+  #} else {r1se <- glm(My~., data=data.1se, subset=cv_train, family="binomial")
+  #}
+  
+  if ( length(features.theory) == 0){ 
+    rtheory <- glm(high.rating~1, data=train, subset=cv_train, family="binomial") 
+  } else {rtheory <- glm(My~., data=data.theory, subset=cv_train, family="binomial") }
+  
+  pred.lr.pl.min <- predict(rmin, newdata=data.min[-cv_train,], type="response")
+  #pred.lr.pl.1se  <- predict(r1se, newdata=data.1se[-cv_train,], type="response")
+  pred.lr.pl.theory <- predict(rtheory, newdata=data.theory[-cv_train,], type="response")
+  
+  OOS$m.lr.pl.min[k] <- PerformanceMeasure(actual=My[-cv_train], prediction=pred.lr.pl.min)
+  #OOS$m.lr.pl.1se[k] <- PerformanceMeasure(actual=My[-cv_train], prediction=pred.lr.pl.1se)
+  OOS$m.lr.pl.theory[k] <- PerformanceMeasure(actual=My[-cv_train], prediction=pred.lr.pl.theory)
+
+  ### Classification tree
+  m.tree <- tree(as.factor(high.rating) ~ ., data=train, subset=cv_train ) 
+  pred.tree <- predict(m.tree, newdata = train[-cv_train,], type="vector")
+  pred.tree <- pred.tree[,2]
+  OOS$m.tree[k] <- PerformanceMeasure(actual=actual, pred=pred.tree)
+  #### tree does not work as we wish. because it's not that
+  
+  ### Random Forest
+  m.rf <- randomForest(high.rating ~ ., data=train, subset=cv_train)
+  pred.rf <- predict(m.rf, newdata=train[-cv_train,],"prob")[,2]
+  OOS$m.rf[k] <- PerformanceMeasure(actual=actual, pred=pred.rf)
+  
+  # we would discuss that after cross validation
+  ### optimized Random Forest
+  #m.rf.opt1 <- randomForest(high.rating ~ ., data=train, subset=cv_train, ntree = 300, mtry = 14)
+  #pred.rf.opt1 <- predict(m.rf.opt1, newdata=train[-cv_train,], "prob")[,2]
+  # use "prob" so that we got probability
+  #OOS$m.rf.opt1[k] <- PerformanceMeasure(actual=actual, pred=pred.rf.opt1)
+  
+  pred.m.average <- rowMeans(cbind(pred.lr,pred.lr.l.min, pred.lr.l.1se, pred.lr.l.theory,
+                                   pred.lr.pl.min, pred.tree, pred.rf ))
+  OOS$m.average[k] <- PerformanceMeasure(actual=My[-cv_train], prediction=pred.m.average)
+  
+  print(paste("Iteration",k,"of",nfold,"(thank you for your patience)"))
+}
+```
+
+```{r check performance of different models}
+OOS
+```
+
+```{r does not have to be included in the paper}
+# just out of curiosity, have a look at the confusion matrix in the last cross validation process
+pred <- predict(m.rf, newdata=train[-cv_train,])  # m.rf in this case would be the 10th random forest in cross validation
+sum(pred == 1 & actual == 1) # TP: 27
+sum(pred == 1 & actual == 0) # FN: 5
+sum(pred == 0 & actual == 1) # FP: 825
+sum(pred == 0 & actual == 0) # FN: 2952
+```
+
+```{r visualize the performance}
+par(mar=c(7,5,.5,1)+0.3)
+barplot(colMeans(OOS), las=2,xpd=FALSE , xlab="", ylim=c(0.6,0.8), ylab = "") 
+# exclude the space kept for post lasso because it does not work (no coefficient chosen)
+# random forest is slightly higher
+```
+
+## Use the whole train data to train the model and test
+
+### tune hyperparameters
+
+```{r tune hyperparamters roughly}
+# take extremely long time to run since it's a function with high computational cost within a for loop
+# we want to tune hyperparameters, but it would be even more time consuming if we consider all different combinations
+# so we choose ntree to be 300-600 and search for the best combinations
+opt_rf_comb <- data.frame("ntree" = c(300,400,500,600), "mtry" = c(NA, NA, NA, NA), "OOBError" = c(NA, NA, NA, NA))
+
+for (i in 1:nrow(opt_rf_comb)) {
+  # use n to traverse all "ntree" values listed above
+  n <- opt_rf_comb$ntree[i]
+  # tuneRF is a function to optimize mtry, which stops when the OOB error is no longer improved by 1e-4
+  bestmtry <- tuneRF(Mx, as.factor(My), mtryStart=5,step=0.9,ntreeTry = n,trace = TRUE,improve=1e-4)
+  # normally improve = 1e-5 but use 1e-4 here to save some time
+  bestmtry <- data.frame(bestmtry)
+  # find the minimized OOB Error and its corresponding mtry value for each loop
+  opt_rf_comb$mtry[i] <- bestmtry$mtry[which(bestmtry$OOBError == min(bestmtry$OOBError))][1]
+  opt_rf_comb$OOBError[i] <- min(bestmtry$OOBError)
+}
+```
+
+```{r}
+opt_rf_comb
+# generally performs best when mtry is in the range of 16
+```
+
+*we want to explain why OOB Error can be a measure to tune hyperparameter and how it is different from OOS (need to google it)*
+
+note that here we could have investigate into details even better, but the roughly trend is already found. it's just a sample of how we think we can search for the best hyper-parameters, while we did not necessarily find the best of the best. that is: 1) we only try ntree from 300 to 600 2) each step is probably not close enough e.g. we know that when n=400 OOBError_min is 20.48% with mtry at either 16 or 18, but we didnt try mtry = 17 3) typically we continue until improvement of OOBError is less than 1e-5 but we use 1e-4 as the criteria here 4) we can even test for the best threshold like target = 1 if p \> 0.5/0.6/0.7, but we use defaulted value 5 here
+
+### tune threshold
+
+Now that we have the optimized model, can we improve accuracy by adjusting threshold?
+
+```{r use k-folder again to compare the performance of these optimal parameters}
+# wait patiently please. there are three random forest models. machine gets tired too ^v^
+set.seed(1)
+nfold <- 5 # it's a smaller number, because it takes extremely long time to finish one round of loop
+n = nrow(train)
+foldid <- rep(1:nfold,each=ceiling(n/nfold))[sample(1:n)]
+
+OOS_opt <- data.frame(m.rf.ori = rep(NA,nfold), m.rf.400.50=rep(NA,nfold), m.rf.500.50=rep(NA,nfold), m.rf.600.50=rep(NA,nfold))
+
+for(k in 1:nfold){ 
+  cv_train <- which(foldid!=k) # train on all but fold `k'
+  actual <- as.numeric(as.character(train$high.rating[-cv_train]))
+  
+  # original random forest as the base model
+  m.rf <- randomForest(high.rating ~., data = train, subset = cv_train)
+  pred.rf <- predict(m.rf, newdata=train[-cv_train,],"prob")[,2]
+  OOS_opt$m.rf.ori[k] <- 1-mean( abs( (pred.rf > 0.5) - actual ) )
+  
+  # different optimized random forest candidates
+  m.rf.400 <- randomForest(high.rating ~., data = train, subset = cv_train, mtry = 16, ntree = 400)
+  pred.rf.400 <- predict(m.rf.400, newdata=train[-cv_train,],"prob")[,2]
+  
+  m.rf.500 <- randomForest(high.rating ~., data = train, subset = cv_train, mtry = 16, ntree = 500)
+  pred.rf.500 <- predict(m.rf.500, newdata=train[-cv_train,],"prob")[,2]
+  
+  m.rf.600 <- randomForest(high.rating ~., data = train, subset = cv_train, mtry = 12, ntree = 600)
+  pred.rf.600 <- predict(m.rf.600, newdata=train[-cv_train,],"prob")[,2]
+  
+  # we can also tune the threshold as well
+  # we could have define a function in a for loop for simplicity
+  # but the point is, we got the same probability prediction, can we improve accuracy by changing threshold?
+  # and if we do, we would have to provide some explanation to justify it
+  OOS_opt$m.rf.400.45[k] <- 1-mean( abs( (pred.rf.400 > 0.45) - actual ) )
+  OOS_opt$m.rf.400.50[k] <- 1-mean( abs( (pred.rf.400 > 0.5) - actual ) )
+  OOS_opt$m.rf.400.55[k] <- 1-mean( abs( (pred.rf.400 > 0.55) - actual ) )
+  OOS_opt$m.rf.400.60[k] <- 1-mean( abs( (pred.rf.400 > 0.6) - actual ) )
+  
+  OOS_opt$m.rf.500.45[k] <- 1-mean( abs( (pred.rf.500 > 0.45) - actual ) )
+  OOS_opt$m.rf.500.50[k] <- 1-mean( abs( (pred.rf.500 > 0.5) - actual ) )
+  OOS_opt$m.rf.500.55[k] <- 1-mean( abs( (pred.rf.500 > 0.55) - actual ) )
+  OOS_opt$m.rf.500.60[k] <- 1-mean( abs( (pred.rf.500 > 0.6) - actual ) )
+  
+  OOS_opt$m.rf.600.45[k] <- 1-mean( abs( (pred.rf.600 > 0.45) - actual ) )
+  OOS_opt$m.rf.600.50[k] <- 1-mean( abs( (pred.rf.600 > 0.5) - actual ) )
+  OOS_opt$m.rf.600.55[k] <- 1-mean( abs( (pred.rf.600 > 0.55) - actual ) )
+  OOS_opt$m.rf.600.60[k] <- 1-mean( abs( (pred.rf.600 > 0.6) - actual ) )
+  
+  print(paste("Iteration",k,"of",nfold,"(thank you for your patience)"))
+}
+```
+
+```{r check the performances of optimized models}
+OOS_opt
+```
+
+```{r visualize the performances}
+par(mar=c(7,5,.5,1)+0.3)
+barplot(colMeans(OOS_opt), las=2,xpd=FALSE , xlab="", ylim=c(0.78,0.8), ylab = "") 
+# exclude the space kept for post lasso
+```
+
+### decide the final model and predict
+
+```{r use the tuned parameter to train the model and predict}
+# seems that set at mtry=16, ntree = 600, threshold = 0.5 makes more sense
+set.seed(1)
+m.rf.opt.final <- randomForest(high.rating ~ ., data=train, ntree = 600, mtry = 12)
+pred.rf.opt.final <- predict(m.rf.opt.final, newdata=test, "prob")[,2]
+# use "prob" so that we got probability
+```
+
+### look at our accuracy score
+
+```{r accuracy}
+# since the original performance measure function set threshold to be 0.5, we would directly use the function
+PerformanceMeasure(actual=as.numeric(as.character(test$high.rating)), pred=pred.rf.opt.final)
+```
+
+```{r}
+test.pred <- predict(m.rf.opt.final, newdata=test)
+test.pred <- as.numeric(as.character(test.pred))
+# this is the 1 and 0 we finally want
+```
+
+### confusion matrix
+
+```{r}
+sum(test.pred == 1 & test$high.rating == 1) # TP: 409
+sum(test.pred == 1 & test$high.rating == 0) # FN: 79
+sum(test.pred == 0 & test$high.rating == 1) # FP: 2467
+sum(test.pred == 0 & test$high.rating == 0) # TN: 9632
+```
+
+### if not satisfied, can we rank?
+
+### roc curve here
+
+```{r roc_auc score and visualization}
+roc_score=roc(test$high.rating, pred.rf.opt.final) #AUC-ROC score, you can print it if needed
+plot(roc_score ,main ="ROC curve")
+# please search for the best way to visualize the ROC score from the class script
+```
+
+### feature importance
+
+```{r look at feature importance}
+varImpPlot(m.rf.opt.final)
+feature_importance <- m.rf.opt.final$importance
+```
